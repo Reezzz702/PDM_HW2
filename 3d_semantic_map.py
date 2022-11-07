@@ -4,7 +4,7 @@ import open3d as o3d
 import copy
 from tqdm import tqdm
 from argparse import ArgumentParser
-import csv
+from sklearn.neighbors import NearestNeighbors
 
 
 SIZE = 512
@@ -42,6 +42,44 @@ def depth_to_point_cloud(rgb, depth):
                             [0, 0, 0, 1]])))
     #o3d.visualization.draw_geometries([pcd])
     return pcd
+
+
+def custom_voxel_down_sample(pcd, voxel_size):
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
+    voxel_index = points // voxel_size # calculate voxel index
+
+    voxel_index = np.unique(voxel_index, axis=0) # remove duplicate index
+    nbrs = NearestNeighbors(n_neighbors=(len(points) // (len(voxel_index))), algorithm='ball_tree').fit(points) # build nearest neighbor tree
+
+    voxel_colors = []
+    voxel_points = []
+
+    # for every voxel index:
+    #   1. project back to original coordinate space
+    #   2. find k-nearest point in original point cloud
+    #   3. record the frequency of each color and find the majority color
+    #   4. color of this voxel -> the majority color
+    for index in voxel_index:
+        point = index * voxel_size
+        voxel_points.append(point)
+
+        distance, indices = nbrs.kneighbors([point])
+        color_count = {}
+        max_count = 0
+        max_color = None
+        for i in indices[0]:
+            color_count[colors[i].tobytes()] = color_count.get(colors[i].tobytes(), 0) + 1
+            if color_count[colors[i].tobytes()] > max_count:
+                max_count = color_count[colors[i].tobytes()]
+                max_color = colors[i]
+        voxel_colors.append(max_color)
+    
+    pcd_down = o3d.geometry.PointCloud()
+    pcd_down.points = o3d.utility.Vector3dVector(voxel_points)
+    pcd_down.colors = o3d.utility.Vector3dVector(voxel_colors)
+
+    return pcd_down
 
 
 def voxel_down_sample(pcd, voxel_size):
@@ -106,16 +144,16 @@ def ICP(floor, data_size, voxel_size, seg, model):
     whole_scene_pcd = o3d.geometry.PointCloud()
     prev_pcd_down = None
     prev_pcd_fpfh = None
-    for i in tqdm(range(data_size - 1)):
-        if i == 0:
-            target_seg = o3d.io.read_image(f"data/floor{floor}/{model}/{seg}/{seg}_{i + 1}.png")
+    for i in tqdm(range(1, data_size)):
+        if i == 1:
+            target_seg = o3d.io.read_image(f"data/floor{floor}/{model}/{seg}/{seg}{i}.png")
             target_depth = transform_depth(
-                o3d.io.read_image(f"data/floor{floor}/depth/depth_{i + 1}.png")
+                o3d.io.read_image(f"data/floor{floor}/depth/depth{i}.png")
             )
             
-            source_seg = o3d.io.read_image(f"data/floor{floor}/{model}/{seg}/{seg}_{i + 1}.png")
+            source_seg = o3d.io.read_image(f"data/floor{floor}/{model}/{seg}/{seg}{i + 1}.png")
             source_depth = transform_depth(
-                o3d.io.read_image(f"data/floor{floor}/depth/depth_{i + 2}.png")
+                o3d.io.read_image(f"data/floor{floor}/depth/depth{i + 1}.png")
             )
 
             target_pcd = depth_to_point_cloud(target_seg, target_depth)
@@ -134,17 +172,16 @@ def ICP(floor, data_size, voxel_size, seg, model):
             )
 
         else:
-            source_seg = o3d.io.read_image(f"data/floor{floor}/{model}/{seg}/{seg}_{i + 2}.png")
+            source_seg = o3d.io.read_image(f"data/floor{floor}/{model}/{seg}/{seg}{i + 1}.png")
+
             source_depth = transform_depth(
-                o3d.io.read_image(f"data/floor{floor}/depth/depth_{i + 2}.png")
+                o3d.io.read_image(f"data/floor{floor}/depth/depth{i + 1}.png")
             )
             source_pcd = depth_to_point_cloud(source_seg, source_depth)
             source_points = np.asarray(source_pcd.points)
             source_pcd = source_pcd.select_by_index(np.where(source_points[:, 1] < 0.5)[0])
 
-            source_pcd_down, source_pcd_fpfh = voxel_down_sample(
-                source_pcd, voxel_size
-            )
+            source_pcd_down, source_pcd_fpfh = voxel_down_sample(source_pcd, voxel_size)
 
             target_pcd_down = copy.deepcopy(prev_pcd_down)
             target_pcd_fpfh = copy.deepcopy(prev_pcd_fpfh)
@@ -166,98 +203,41 @@ def ICP(floor, data_size, voxel_size, seg, model):
         result_icp = refine_registration(
                 source_pcd_down,
                 target_pcd_down,
-                source_pcd_fpfh,
-                target_pcd_fpfh,
                 voxel_size,
                 result_ransac.transformation,
             )
         result_transformation = result_icp.transformation
 
         # T_t+1 = T_t @ currentT_t+1
-        if i == 0:
+        if i == 1:
             whole_scene_pcd += target_pcd
             cur_transformation = result_transformation
         else:
             cur_transformation = transformation_seq[-1] @ result_transformation
 
         # apply transform to project current pcd to original coordinate system
-        source_pcd.transform(cur_transformation)
+        source_pcd_down.transform(cur_transformation)
         transformation_seq.append(cur_transformation)
         # accumulate pcd
-        whole_scene_pcd += source_pcd
+        whole_scene_pcd += source_pcd_down
 
-    # record reconstructed poses
-    reconstruct_pose = [[0, 0, 0]]
-    reconstruct_link = []
-    for i, t in enumerate(transformation_seq):
-        translation = [t[0, -1], t[1, -1], t[2, -1]]
-        reconstruct_pose.append(translation)
-        reconstruct_link.append([i, i + 1])
-    reconstruct_link.pop(-1)
-
-    
-    # create reconstructed lineset
-    colors = [[1, 0, 0] for _ in range(len(reconstruct_link))]
-    reconstruct_line_set = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(reconstruct_pose),
-        lines=o3d.utility.Vector2iVector(reconstruct_link),
-    )
-    reconstruct_line_set.colors = o3d.utility.Vector3dVector(colors)
-    # show result
-    return whole_scene_pcd, reconstruct_line_set, reconstruct_pose
+    return whole_scene_pcd
 
 
 def main(args):
     # parameters
     voxel_size = args.voxel_size
     data_size = len(os.listdir(f"data/floor{args.floor}/depth"))
-
-    GT_pose = []
-    GT_link = []
-    with open(f"data/floor{args.floor}/GT.csv", "r") as f:
-        csvreader = csv.reader(f)
-        first_row = next(csvreader)
-        first_coor = None
-        count = 1
-        for i in range(3):
-            first_row[i] = float(first_row[i])
-            first_coor = np.asarray(first_row[:3], dtype=np.float32)
-            coor = first_coor - first_coor
-        GT_pose.append(coor)
-
-        for row in csvreader:
-            for i in range(3):
-                row[i] = float(row[i])
-                coor = np.asarray(row[:3], dtype=np.float32)
-                coor -= first_coor
-            GT_pose.append(coor)
-            GT_link.append([count - 1, count])
-            count += 1
-        f.close()
-
-    # create GT lineset
-    colors = [[0, 0, 0] for _ in range(len(GT_link))]
-    GT_line_set = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(GT_pose),
-        lines=o3d.utility.Vector2iVector(GT_link),
-    )
-    GT_line_set.colors = o3d.utility.Vector3dVector(colors)
     
-    pcd, recconstruction_line_set, reconstruct_pose = ICP(args.floor, data_size, voxel_size, args.seg, args.model)
+    pcd = ICP(args.floor, data_size, voxel_size, args.seg, args.model)
+    pcd = custom_voxel_down_sample(pcd, 0.1)
+    o3d.visualization.draw_geometries([pcd])
 
-    o3d.visualization.draw_geometries(
-        [pcd, recconstruction_line_set, GT_line_set]
-    )
-
-     # calculate mean L2 norm
-    GT = np.asarray(GT_pose)
-    reconstruct = np.asarray(reconstruct_pose)
-    print(np.mean(np.linalg.norm(GT - reconstruct, axis = 1)))
 
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("-v", dest="voxel_size", help="voxel size", type=float)
-    parser.add_argument("-f", dest="floor", help="select floor: [0, 1]", type=int)
-    parser.add_argument("-s", dest="seg", help="segment source(pred or seg)", type=str)
+    parser.add_argument("-f", dest="floor", help="select floor: [1, 2]", type=int)
+    parser.add_argument("-s", dest="seg", help="segment source(pred or ground)", type=str)
     parser.add_argument("-m", dest="model", help="select model(apartment_0 or others)", type=str)
     main(parser.parse_args())
